@@ -6,11 +6,11 @@ determine the subject of the user's input so that a logical response can be
 selected from the database.
 
 As a very simple example, lets say your database has a key of "cats" with a
-value of "I really like cats. I collect them." The conversation would look
+value of "I really like cats. I often collect them." The conversation would look
 something like this:
 ```
 Query> what do you think of cats?
-I really like cats. I collect them.
+I really like cats. I often collect them.
 ```
 
 ## How to create the MySQL table
@@ -39,15 +39,15 @@ default your database will be empty and you'll need to teach it. There are
 several different ways to teach it, so just follow along with the example
 below and you can figure it out:
 ```
-Query> learn cats: I really like cats. I collect them.
+Query> learn cats: I really like cats. I often collect them.
 
 Query> set dogs = I like dogs. They get your sense of humor. Nobody else does that.
 
 Query> what do you think of dogs?
- Dogs are pretty great. They appreciate your sense of humor. Nobody else does.
+ I like dogs. They get your sense of humor. Nobody else does that.
 
 Query> I hate cats.
- I really like cats. I collect them.
+ I really like cats. I often collect them.
 ```
 "Set" and "learn" do the same thing.
 
@@ -58,7 +58,7 @@ follows:
 ```
 Query> get cats
 ----
-cats:  I really like cats. I collect them.
+cats:  I really like cats. I often collect them.
 ```
 The "list" keyword is another way to use the "get" keyword.
 
@@ -68,7 +68,7 @@ follows:
 ```
 Query> forget cats
 ----
-cats:  I really like cats. I collect them.
+cats:  I really like cats. I often collect them.
 
 Delete above rows? (Y/N): y
 Query> get cats
