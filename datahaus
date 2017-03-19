@@ -1,0 +1,334 @@
+#!/usr/bin/python
+
+import sys
+import os
+import MySQLdb as mysqldb
+import nltk
+import doctest
+
+dbc = None
+qb = None
+db_session = None
+silent_exit = False
+BYE = "bye"
+DEFAULT_REPLY = "I don't have anything to say about that."
+BAD_INSERT_SPLIT_MSG = "Uh oh, it looks like you used splitters incorrectly."
+DB_HOST = 'localhost'
+DB_USER = 'root'
+DB_PASSWORD = 'thispass'
+DB_TO_USE = 'datahaus_default'
+TABLE = 'key_value_pairs'
+VALUE_KEY_NAME = 'k'
+INSERT_SPLITTERS = ['=', ':']
+EXIT_CMDS = ['exit', 'EXIT', 'quit', 'QUIT', 'bye', 'BYE', ':x']
+GET_CMDS  = ['get', 'GET', 'list']
+SET_CMDS  = ['set', 'SET', 'learn']
+DEL_CMDS  = ['del', 'drop', 'forget']
+
+
+class QueryBuilder:
+    """
+    This class holds our database queries and presents them in an easy-to-use
+    interface. The queries returned here can be executed by passing them to
+    qurey_one, query_all, etc.
+    """
+    def commit(self):
+        """
+        Returns a query to commit the changes to the database.
+        """
+        return 'COMMIT'
+
+    def get_like(self, search, selector='*', table=TABLE, key=VALUE_KEY_NAME):
+        """
+        Returns a query to select all rows from table where key is like search.
+        This query is a partial match. That is, 'foo' will count as a match for
+        'foo bar' and 'foo bar baz'.
+        """
+        return 'SELECT %s FROM %s WHERE %s LIKE "%%%s%%"' % (selector, table,
+                                                             key, search)
+
+    def get_this(self, search, selector='*', table=TABLE, key=VALUE_KEY_NAME):
+        """
+        Returns a query to select all rows from table where key is the same as
+        search. This query is an exact match. That is, 'foo' will NOT count as
+        a match for 'foo bar' or 'foo bar baz'.
+        """
+        return 'SELECT %s FROM %s WHERE %s LIKE "%s"' % (selector, table,
+                                                         key, search)
+
+    def delete(self, search, table=TABLE, key=VALUE_KEY_NAME):
+        """
+        Returns a query to delete rows containing search in key.
+        """
+        return 'DELETE FROM %s WHERE %s LIKE "%%%s%%"' % (table, key, search)
+
+    def insert(self, values, table=TABLE):
+        """
+        Returns a query to insert values into table.
+        """
+        return 'INSERT INTO %s VALUES%s' % (table, values)
+
+
+def main(data_source='stdin'):
+    global silent_exit
+    __run_loop__ = True
+    connect_to_db()
+    while __run_loop__:
+        # determine if we are running once through the command line
+        # or interactivly through the console
+        if data_source == 'stdin':
+            out("Query> ")
+            data = sys.stdin.readline().strip()
+        else:
+            data = data_source
+            silent_exit = True
+            __run_loop__ = False
+        # check if the input was empty
+        if not data:
+            continue
+        # check if we're supposed to exit now
+        if data in EXIT_CMDS:
+            clean_exit()
+        else:
+            # get - check if we're making a database query
+            if data.split()[0] in GET_CMDS:
+                string = remove_first_word(data)
+                string = db_session.escape_string(string)
+                sqlout(query_all(qb.get_like(search=string)))
+            # set - check if we're adding to the database/learning
+            elif data.split()[0] in SET_CMDS:
+                string = remove_first_word(data)
+                string = db_session.escape_string(string)
+                string = split_for_insert(string)
+                try:
+                    # print the query in case it returns any errors
+                    sqlout(query_all(qb.insert(string)))
+                except:
+                    # tell them if they used too many split characters
+                    print BAD_INSERT_SPLIT_MSG + '\n'
+            # del - check if we're deleting from the database/forgetting
+            elif data.split()[0] in DEL_CMDS:
+                string = remove_first_word(data)
+                remove_from_db(data)
+            else:
+                # have to escape these enough times to match our escaped
+                # data in the database
+                data = db_session.escape_string(data)
+                data = db_session.escape_string(data)
+                data = db_session.escape_string(data)
+                process_input(data)
+        # cleanly exit if this is not an interactive session
+        if silent_exit:
+            clean_exit(silent=True)
+
+
+def remove_from_db(data):
+    string = remove_first_word(data)
+    string = db_session.escape_string(string)
+    rows = query_all(qb.get_like(search=string))
+    if rows:
+        sqlout(rows)
+        while True:
+            out('Delete above rows? (Y/N): ')
+            confirmation = sys.stdin.readline().strip()
+            if confirmation == 'n' or confirmation == 'N':
+                return
+            else:
+                result = query_all(qb.delete(search=string))
+                if result:
+                    print str(result) + '\n'
+                return
+    else:
+        print 'No rows containing "%s" were found.' % string
+
+
+def process_input(data):
+    # try to get an exact match in the database for the input
+    response = query_one(qb.get_this(data))
+    if not response:
+        # if no exact match  can be found, display the first
+        # similar result
+        response = query_one(qb.get_like(data))
+        if not response:
+            # if no similar results can be found, try to determine the subject
+            # of the input usinj the NLTK
+            # print DEFAULT_REPLY + '\n'
+            subjects = find_subject(data)
+            subject = subjects[0]
+            subjects_count = len(subjects)
+            # DEBUG: print out what we think the subject is
+            out('[Subject: ')
+            for i in range(subjects_count):
+                out('%s' % subjects[i])
+                if i+1 < subjects_count:
+                    out(' and ')
+            out(']\n')
+            # and then get the first reply that is similar to the subject
+            response = query_one(qb.get_like(subject))
+            if not response or response is "\n":
+                # if there is nothing related to the subject, just say the
+                # default message
+                response = ['', DEFAULT_REPLY + '\n']
+    if response:
+        reply = response[1].decode('string_escape')
+        print reply + '\n'
+        return
+
+
+def find_subject(sentence, debug=False):
+    """
+    Uses NLTK to find the subject of a sentense by returning a list of
+    all words tagged NN. If no NNs are found, it will return all NNSs.
+    >>> find_subject('This is about waterfalls.')
+    ['waterfalls']
+    >>> find_subject('I would love to see a big waterfall someday!')
+    ['waterfall', 'someday']
+    """
+    def loop(search):
+        for word in tags:
+            if word[1] == search:
+                subjects.append(word[0])
+    tokens = nltk.word_tokenize(sentence)
+    tags = nltk.pos_tag(tokens)
+    subjects = []
+    loop('NNS')
+    if len(subjects) < 1:
+        loop('NN')
+    if debug:
+        print tags
+        print subjects
+    return subjects
+
+
+def count_occurances(word):
+    """
+    Counts how many times word is found in the database.
+    """
+    keys = query_all(qb.get_like(selector='k', search=word))
+    values = query_all(qb.get_like(selector='v', search=word, key='v'))
+    print 'k: ' + str(keys)
+    print 'v: ' + str(values)
+
+
+def connect_to_db():
+    """
+    Connects to the database using our globally defined variables.
+    """
+    global db_session
+    global dbc
+    global qb
+    db_session = mysqldb.connect(DB_HOST, DB_USER, DB_PASSWORD, DB_TO_USE)
+    dbc = db_session.cursor()
+    qb = QueryBuilder()
+
+
+def clean_exit(silent=False):
+    """
+    Politely commit the changes to the database and close the connecion,
+    giving the user output if desired.
+    """
+    global qb
+    global db_session
+    if not silent:
+        print 'Committing changes to database...'
+    serversays = query_all(qb.commit())
+    if serversays:
+        out(serversays)
+    db_session.close()
+    if not silent:
+        print BYE
+    sys.exit(0)
+
+
+def split_for_insert(string):
+    # TODO: Explain this...
+    """
+    >>> split_for_insert('foo=bar')
+    ('foo', 'bar')
+    """
+    for splitter in INSERT_SPLITTERS:
+        if splitter in string:
+            return tuple(string.split(splitter))
+
+
+def remove_first_word(data):
+    """
+    Removes the first word in a string, that is the first letter up to the
+    first space.
+    >>> remove_first_word('set foo=bar')
+    'foo=bar'
+    """
+    string = data.split()
+    string.pop(0)
+    string = ' '.join(string)
+    return string
+
+
+def get_longest_key(sql):
+    """
+    Returns the length of the longest key in a touple of touples. For Example:
+    >>> get_longest_key((('key', 'value'), ('keykey', 'value'),
+    ... ('keey', 'value')))
+    6
+    """
+    longest = 0
+    for tup in sql:
+        if len(tup[0]) > longest:
+            longest = len(tup[0])
+    return longest
+
+
+def query_all(string):
+    """
+    Makes an SQL query for string and fetches all results
+    """
+    dbc.execute(string)
+    return dbc.fetchall()
+
+
+def query_one(string):
+    """
+    Makes an SQL query for string and fetches one result.
+    """
+    dbc.execute(string)
+    return dbc.fetchone()
+
+
+def out(string):
+    """
+    Pints a string without newlines.
+    >>> out('foo')
+    foo
+    """
+    sys.stdout.write(string)
+    sys.stdout.flush()
+
+
+def sqlout(sql):
+    """
+    Formats and displays SQL data returned as tuples inside tuples.
+
+    >>> sqlout((('foo', 'bar'), ('quuuux', 'baz')))
+    ------
+    foo   : bar
+    quuuux: baz
+    <BLANKLINE>
+
+    """
+    longest_key = get_longest_key(sql)
+    print '-' * longest_key
+    for (key, value) in sql:
+        print '%s%s: %s' % (key, ' '*(longest_key-len(key)), value)
+    if longest_key:
+        print
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'doctest':
+            doctest.testmod()
+        else:
+            print sys.argv[1]
+        main(data_source=sys.argv[1])
+    else:
+        main()
